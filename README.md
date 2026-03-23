@@ -3,10 +3,10 @@
 A lightweight SMTP relay written in Python that accepts mail from **legacy services** (old SQL Reporting Services, ERP mailers, line-of-business apps) that cannot use modern authentication, and re-delivers every message to a single Office 365 mailbox via **SMTP AUTH with STARTTLS**.
 
 ```
-Legacy service  ──SMTP──►  smtp-relay (this server)  ──STARTTLS/AUTH──►  smtp.office365.com  ──►  test@some.es
+Legacy service  ──SMTP──►  smtp-relay (this server)  ──STARTTLS/AUTH──►  smtp.office365.com  ──►  test@domain.com
 (no modern auth)             listens on :25                port 587
-e.g. 1@some.local
-     2@some.local
+e.g. 1@domain.local
+     2@domain.local
 ```
 
 ---
@@ -18,7 +18,7 @@ e.g. 1@some.local
 Microsoft disables per-account SMTP AUTH by default. You must enable it before the relay can authenticate.
 
 1. Sign in to the **Microsoft 365 admin center** → **Users** → **Active users**.
-2. Select the account that will send mail (e.g. `test@some.es`).
+2. Select the account that will send mail (e.g. `test@domain.com`).
 3. Open the **Mail** tab → **Manage email apps**.
 4. Tick **Authenticated SMTP** and save.
 
@@ -41,7 +41,7 @@ Microsoft disables per-account SMTP AUTH by default. You must enable it before t
 
 ```bash
 # 1. Clone / copy the project
-cd MailServerSOME
+cd LocalMailServer
 
 # 2. Create the config file
 copy .env.example .env
@@ -92,10 +92,10 @@ All settings are in `.env` (copy from `.env.example`).
 | `O365_SMTP_PORT` | `587` | O365 SMTP port (STARTTLS) |
 | `O365_USERNAME` | — | **Required.** O365 account that authenticates and sends |
 | `O365_PASSWORD` | — | **Required.** Account or app password |
-| `FORWARD_TO` | `test@some.es` | Final delivery address for all relayed messages |
+| `FORWARD_TO` | `test@domain.com` | Final delivery address for all relayed messages |
 | `REWRITE_FROM` | `true` | Replace `From` header with O365_USERNAME (recommended) |
-| `ALLOWED_SENDERS` | `1@some.local,2@some.local` | Exact sender addresses permitted |
-| `ALLOWED_SENDER_DOMAINS` | `some.local` | Whole domains permitted (any `@domain`) |
+| `ALLOWED_SENDERS` | `1@domain.local,2@domain.local` | Exact sender addresses permitted |
+| `ALLOWED_SENDER_DOMAINS` | `domain.local` | Whole domains permitted (any `@domain`) |
 | `ALLOWED_CLIENT_IPS` | `127.0.0.1,::1` | Client IPs allowed to connect. **Add your server IPs here.** Leave empty to allow all (isolated networks only). |
 | `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
 
@@ -118,14 +118,14 @@ Point each legacy application's **SMTP server / smarthost** setting to the machi
 
 ## What happens to each message
 
-1. Legacy service sends an email with `From: 1@some.local` (or `2@some.local`).
+1. Legacy service sends an email with `From: 1@domain.local` (or `2@domain.local`).
 2. The relay accepts the connection (IP + sender checks pass).
 3. Before forwarding, the relay:
-   - Adds `X-Original-From: 1@some.local` and `X-Original-To: <whatever>` headers.
-   - **Rewrites `From`** to `test@some.es` (O365_USERNAME) so O365 accepts the submission.
-   - Sets `Reply-To: 1@some.local` so replies go back to the original sender.
-4. The relay connects to `smtp.office365.com:587`, authenticates, and delivers to `test@some.es`.
-5. The user at `test@some.es` receives the email and can see the original sender in `Reply-To` / `X-Original-From`.
+   - Adds `X-Original-From: 1@domain.local` and `X-Original-To: <whatever>` headers.
+   - **Rewrites `From`** to `test@domain.com` (O365_USERNAME) so O365 accepts the submission.
+   - Sets `Reply-To: 1@domain.local` so replies go back to the original sender.
+4. The relay connects to `smtp.office365.com:587`, authenticates, and delivers to `test@domain.com`.
+5. The user at `test@domain.com` receives the email and can see the original sender in `Reply-To` / `X-Original-From`.
 
 ---
 
