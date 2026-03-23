@@ -60,7 +60,8 @@ AZURE_CLIENT_ID: str = os.getenv("AZURE_CLIENT_ID", "")
 AZURE_CLIENT_SECRET: str = os.getenv("AZURE_CLIENT_SECRET", "")
 
 # All accepted messages are forwarded to this single destination address.
-FORWARD_TO: str = os.getenv("FORWARD_TO", "test@some.es")
+# Empty string = preserve original recipients.
+FORWARD_TO: str = os.getenv("FORWARD_TO", "")
 
 # When true, the From header is replaced with O365_USER so that the submission
 # is accepted without "send-as" permissions on the mailbox.
