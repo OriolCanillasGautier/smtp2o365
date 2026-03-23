@@ -1,0 +1,6 @@
+# Core SMTP server and client libraries
+aiosmtpd>=1.4.4
+aiosmtplib>=2.0.2
+
+# Load settings from .env file
+python-dotenv>=1.0.0

@@ -1,0 +1,31 @@
+version: "3.9"
+
+services:
+  smtp-relay:
+    build: .
+    container_name: smtp-relay
+    restart: unless-stopped
+
+    ports:
+      # Host port 25 → container port 25.
+      # If port 25 is already taken on the host (e.g. by another mail service),
+      # change the left side: "2525:25" and update LISTEN_PORT in .env accordingly.
+      - "25:25"
+
+    env_file:
+      - .env           # Copy .env.example → .env and fill in your credentials
+
+    # Required on Linux to allow binding a port < 1024 as a non-root user.
+    # Safe to remove on Windows / Docker Desktop.
+    cap_add:
+      - NET_BIND_SERVICE
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # Optional: keep logs in a volume for easier inspection
+    # volumes:
+    #   - relay-logs:/app/logs
