@@ -152,6 +152,9 @@ async def relay_via_smtp(envelope) -> None:
     """Re-deliver the received message through Office 365 SMTP AUTH + STARTTLS."""
     msg = _prepare_message(envelope)
 
+    # Use FORWARD_TO if defined, otherwise preserve original recipients.
+    recipients = [FORWARD_TO] if FORWARD_TO else envelope.rcpt_tos
+
     await aiosmtplib.send(
         msg,
         hostname=O365_HOST,
@@ -160,7 +163,7 @@ async def relay_via_smtp(envelope) -> None:
         username=O365_USER,
         password=O365_PASS,
         sender=O365_USER,        # SMTP envelope MAIL FROM
-        recipients=[FORWARD_TO], # SMTP envelope RCPT TO
+        recipients=recipients,   # SMTP envelope RCPT TO
         timeout=30,
     )
 
@@ -171,11 +174,11 @@ async def relay_via_graph(envelope) -> None:
 
     msg = _prepare_message(envelope)
 
-    # Graph API delivers to the To header address.
-    # Override it with FORWARD_TO (original value already saved in X-Original-To).
-    while "To" in msg:
-        del msg["To"]
-    msg["To"] = FORWARD_TO
+    # If FORWARD_TO is defined, override To header. Otherwise preserve original recipients.
+    if FORWARD_TO:
+        while "To" in msg:
+            del msg["To"]
+        msg["To"] = FORWARD_TO
 
     # Serialise the modified message back to MIME bytes.
     buf = BytesIO()

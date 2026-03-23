@@ -108,7 +108,7 @@ All settings are in `.env` (copy from `.env.example`).
 | `AZURE_TENANT_ID` | — | **oauth2_graph only.** Directory (tenant) ID |
 | `AZURE_CLIENT_ID` | — | **oauth2_graph only.** Application (client) ID |
 | `AZURE_CLIENT_SECRET` | — | **oauth2_graph only.** Client secret value |
-| `FORWARD_TO` | `test@domain.com` | Final delivery address for all relayed messages |
+| `FORWARD_TO` | — | **Optional.** If set, all emails are redirected to this single address. If **empty**, each email is delivered to its original recipients (To/Cc headers preserved). |
 | `REWRITE_FROM` | `true` | Replace `From` header with `O365_USERNAME` (recommended) |
 | `ALLOWED_SENDERS` | `1@domain.local,2@domain.local` | Exact sender addresses permitted |
 | `ALLOWED_SENDER_DOMAINS` | `domain.local` | Whole domains permitted (any `@domain`) |
@@ -134,14 +134,29 @@ Point each legacy application's **SMTP server / smarthost** setting to the machi
 
 ## What happens to each message
 
-1. Legacy service sends an email with `From: 1@domain.local` (or `2@domain.local`).
+### Scenario A: FORWARD_TO is set (redirect mode)
+
+1. Legacy service sends an email with `From: user1@domain.local` to multiple recipients.
 2. The relay accepts the connection (IP + sender checks pass).
 3. Before forwarding, the relay:
-   - Adds `X-Original-From: 1@domain.local` and `X-Original-To: <whatever>` headers.
-   - **Rewrites `From`** to `test@domain.com` (O365_USERNAME) so O365 accepts the submission.
-   - Sets `Reply-To: 1@domain.local` so replies go back to the original sender.
-4. The relay connects to `smtp.office365.com:587`, authenticates, and delivers to `test@domain.com`.
-5. The user at `test@domain.com` receives the email and can see the original sender in `Reply-To` / `X-Original-From`.
+   - Adds `X-Original-From: user1@domain.local` and `X-Original-To: <original recipients>` headers.
+   - **Rewrites `From`** to `O365_USERNAME` (e.g. `relay@domain.com`) so O365 accepts the submission.
+   - Sets `Reply-To: user1@domain.local` so replies go back to the original sender.
+   - **Replaces `To`** with the single address in `FORWARD_TO`.
+4. The relay connects to Office 365 and delivers to `FORWARD_TO` only.
+5. The designated recipient receives the email and can see the original sender in `Reply-To` / `X-Original-From`.
+
+### Scenario B: FORWARD_TO is empty (preserve recipients)
+
+1. Legacy service sends an email with `From: user1@domain.local` to `recipient1@domain.com, recipient2@domain.com`.
+2. The relay accepts the connection (IP + sender checks pass).
+3. Before forwarding, the relay:
+   - Adds `X-Original-From: user1@domain.local` and `X-Original-To:` headers.
+   - **Rewrites `From`** to `O365_USERNAME`.
+   - Sets `Reply-To: user1@domain.local`.
+   - **Preserves `To/Cc`** headers unchanged.
+4. The relay connects to Office 365 and delivers to all original recipients (`recipient1@domain.com, recipient2@domain.com`).
+5. Each recipient receives the email exactly as intended, with the original sender preserved in `Reply-To` / `X-Original-From`.
 
 ---
 
