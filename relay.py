@@ -13,6 +13,7 @@ All configuration is driven by environment variables (or a .env file in the
 same directory).  See .env.example for full documentation.
 """
 
+import base64
 import logging
 import os
 import time
@@ -191,10 +192,10 @@ async def relay_via_graph(envelope) -> None:
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.post(
             f"https://graph.microsoft.com/v1.0/users/{O365_USER}/sendMail",
-            content=mime_bytes,
+            content=base64.b64encode(mime_bytes),
             headers={
                 "Authorization": f"Bearer {token}",
-                # Graph accepts raw MIME when Content-Type is text/plain
+                # Graph /sendMail MIME endpoint requires base64-encoded content
                 "Content-Type": "text/plain",
             },
         )
