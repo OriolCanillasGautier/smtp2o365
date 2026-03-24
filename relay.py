@@ -226,11 +226,17 @@ class RelayHandler:
             log.warning("Rejected MAIL FROM <%s> — sender not allowed", address)
             return "550 5.7.1 Sender not allowed"
 
-        return "250 OK"  # aiosmtpd sets envelope.mail_from automatically on 250
+        # aiosmtpd only updates the envelope when the hook returns MISSING (no hook).
+        # Since we define this hook, we must update the envelope manually.
+        envelope.mail_from = address
+        envelope.mail_options.extend(mail_options)
+        return "250 OK"
 
     async def handle_RCPT(self, server, session, envelope, address, rcpt_options):
         # Accept any RCPT TO — filtering happens at MAIL FROM level.
-        # aiosmtpd appends the address to envelope.rcpt_tos automatically on 250.
+        # aiosmtpd only updates the envelope when the hook returns MISSING (no hook),
+        # so we must append the recipient manually.
+        envelope.rcpt_tos.append(address)
         return "250 OK"
 
     async def handle_DATA(self, server, session, envelope):
