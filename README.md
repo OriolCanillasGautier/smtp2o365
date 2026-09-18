@@ -229,6 +229,163 @@ If a redirect target can never be resolved and no recipients remain, the message
 
 ---
 
+## When the application insists on a username and password
+
+Many legacy mailers will not let you save an SMTP configuration unless you fill
+in credentials, even for an internal smarthost. The relay can accept SMTP AUTH
+itself:
+
+```
+Legacy app ──SMTP AUTH (relayuser / relaypass)──► smtp-relay ──OAuth2/Graph──► Office 365
+             "the password" is for the relay       holds the real O365 secret
+```
+
+**The password your application stores is for the relay, not for Office 365.**
+The application never sees the Azure client secret, and the O365 authentication
+is unchanged.
+
+Pick whichever option fits how much you want to manage:
+
+### Option 1 — one shared credential (simplest)
+
+```env
+RELAY_AUTH_USERNAME=relayuser
+RELAY_AUTH_PASSWORD=a-strong-shared-password
+```
+
+Every legacy service logs in with `relayuser` / `a-strong-shared-password`.
+Which Office 365 account the mail is sent from still depends on the sender
+address, exactly as before.
+
+### Option 2 — one credential per sender (recommended)
+
+```env
+RELAY_AUTH_CREDENTIALS=sap@some.local:sap-relay-pass,1@some.local:rs-relay-pass
+```
+
+Each application authenticates with its own identity, so one leaked password
+does not expose the others. The username may be the sender address (most
+natural), or any label you like — the Sender/routing logic is driven by
+`MAIL FROM`, not by the AUTH username.
+
+### Option 3 — accept any password
+
+```env
+RELAY_AUTH_USERNAME=relayuser
+RELAY_AUTH_PASSWORD=*
+```
+
+or per sender:
+
+```env
+RELAY_AUTH_CREDENTIALS=sap@some.local:*
+```
+
+The username is still checked, but the password is ignored. This satisfies an
+application that demands a password field without you having to manage one.
+IP + sender allow-lists remain the only real protection, so use it only on a
+trusted network.
+
+### Do all applications have to log in?
+
+No — and this is the usual case, since only some legacy mailers demand a password
+field. `RELAY_AUTH_POLICY` decides:
+
+| Policy | A client with the right password | A client with no password | A client with a wrong password |
+|---|---|---|---|
+| `optional` *(default)* | ✅ accepted | ✅ accepted (IP + sender allow-lists still apply) | ❌ `535` |
+| `required` | ✅ accepted | ❌ `530 Authentication required` | ❌ `530` |
+
+```env
+RELAY_AUTH_CREDENTIALS=sap@company.local:change-me
+RELAY_AUTH_POLICY=optional      # SAP logs in; your other apps carry on unchanged
+```
+
+So you can turn AUTH on for the one application that wants it without touching
+any other application — nothing else has to change, and no other app is forced to
+start sending credentials. Note that a **wrong** password is still refused even in
+`optional` mode, so a client that attempts AUTH and gets it wrong does not
+silently fall back to the anonymous path.
+
+There is no per-application "must log in / may skip" split on a single port: in
+`optional` mode the IP and sender allow-lists remain the real access control, and
+AUTH is an addition for the clients that need it. If you want to *force* one
+application to authenticate, give it its own relay instance with
+`RELAY_AUTH_POLICY=required`.
+
+### What the client sees
+
+Once any of the above is set, the relay advertises `AUTH PLAIN LOGIN` in its
+`EHLO` response. Whether a login is then *demanded* depends on
+`RELAY_AUTH_POLICY`:
+
+```
+EHLO relay
+250-AUTH PLAIN LOGIN
+...
+# RELAY_AUTH_POLICY=optional (default)
+MAIL FROM:<sap@some.local>          ← no AUTH sent
+250 OK                              ← accepted anyway
+
+# RELAY_AUTH_POLICY=required
+MAIL FROM:<sap@some.local>          ← no AUTH sent
+530 5.7.0 Authentication required
+```
+
+Typical application settings then become:
+
+| Setting | Value |
+|---|---|
+| SMTP server | `<IP of the relay>` |
+| Port | `25` (or your `LISTEN_PORT`) |
+| Authentication | **On** — "plain"/"login"/"password" |
+| Username | `relayuser`, or the sender address with Option 2 |
+| Password | the relay password you configured |
+| TLS/SSL | None (unless you enable STARTTLS below) |
+
+### Encryption (optional)
+
+AUTH is sent in cleartext by default, which is normal on a trusted LAN. If your
+policy requires encryption — or the application refuses to authenticate over a
+plain connection — give the relay a certificate and it will offer STARTTLS:
+
+```bash
+openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+  -keyout relay.key -out relay.crt -subj "/CN=smtp-relay.some.local"
+```
+
+```env
+LISTEN_TLS_CERT=/app/relay.crt
+LISTEN_TLS_KEY=/app/relay.key
+RELAY_AUTH_REQUIRE_TLS=true
+```
+
+Mount the files into the container (e.g. add `- ./relay.crt:/app/relay.crt:ro`
+to `docker-compose.yml`). With `RELAY_AUTH_REQUIRE_TLS=true` the relay refuses to
+authenticate until the client has issued `STARTTLS`; the relay will not start if
+you set it without a certificate. Legacy clients that cannot do STARTTLS should
+keep `RELAY_AUTH_REQUIRE_TLS=false`.
+
+Leaving every `RELAY_AUTH_*` variable empty keeps the previous behaviour: mail is
+accepted without a login and the IP/sender allow-lists are the only gate. (The
+relay still lists `AUTH PLAIN LOGIN` in `EHLO` because aiosmtpd always offers its
+built-in mechanisms; logins are simply rejected unless you configure credentials,
+and nothing depends on them.)
+### Testing AUTH without touching Office 365
+
+`smoke_test/test_auth_integration.py` starts a **real aiosmtpd listener** with the
+relay's handler and authenticator on `127.0.0.1:8027`, stubs the upstream O365
+delivery, and checks every reply code (`235` on success, `535` on bad credentials,
+`530` on `MAIL FROM` before login):
+
+```bash
+python -m pip install --target .venv-test/Lib/site-packages aiosmtpd
+set PYTHONPATH=.venv-test\Lib\site-packages
+python smoke_test/test_auth_integration.py
+```
+
+---
+
 ## Configuration reference
 
 All settings are in `.env` (copy from `.env.example`). `<n>` is an account number (`_2`, `_3`, …); a setting without a suffix applies to all accounts as the default.
@@ -258,6 +415,12 @@ All settings are in `.env` (copy from `.env.example`). `<n>` is an account numbe
 | `ALLOWED_SENDERS` | `1@domain.local,2@domain.local` | Exact sender addresses permitted |
 | `ALLOWED_SENDER_DOMAINS` | `domain.local` | Whole domains permitted (any `@domain`) |
 | `ALLOWED_CLIENT_IPS` | `127.0.0.1,::1` | Client IPs allowed to connect. **Add your server IPs here.** Leave empty to allow all (isolated networks only). |
+| `RELAY_AUTH_USERNAME` | — | **Optional.** SMTP AUTH username the legacy clients must use |
+| `RELAY_AUTH_PASSWORD` | — | **Optional.** Password for `RELAY_AUTH_USERNAME` (`*` = accept any) |
+| `RELAY_AUTH_CREDENTIALS` | — | **Optional.** Per-sender credentials, `user:pass,user:pass` |
+| `RELAY_AUTH_POLICY` | `optional` | `optional` = AUTH offered, clients without a password still accepted · `required` = every client must authenticate |
+| `RELAY_AUTH_REQUIRE_TLS` | `false` | Require STARTTLS before accepting AUTH |
+| `LISTEN_TLS_CERT` / `LISTEN_TLS_KEY` | — | **Optional.** PEM cert + key to offer STARTTLS on the relay |
 | `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
 
 At startup the relay prints one line per configured account, its routing rules and its redirect target, so `docker compose logs` is enough to confirm the routing table.
@@ -288,7 +451,7 @@ Point each legacy application's **SMTP server / smarthost** setting to the machi
 
 The **sender address each service uses decides which O365 account and which destination it gets.** Nothing else has to change on the legacy side.
 
-> **Security note:** The relay intentionally accepts unauthenticated connections from legacy clients. It is protected by the `ALLOWED_CLIENT_IPS` and `ALLOWED_SENDERS` allow-lists. **Never expose port 25 to the internet** — bind it to an internal interface or restrict it with a firewall rule.
+> **Security note:** The relay accepts unauthenticated connections from legacy clients **unless** you configure `RELAY_AUTH_*`. It is protected by the `ALLOWED_CLIENT_IPS` and `ALLOWED_SENDERS` allow-lists (and by SMTP AUTH when enabled). **Never expose port 25 to the internet** — bind it to an internal interface or restrict it with a firewall rule.
 
 ---
 
@@ -331,6 +494,10 @@ The **sender address each service uses decides which O365 account and which dest
 | `451 4.3.0 … Graph API /sendMail returned 403 for <mailbox>` | App lacks Mail.Send consent, or an application access policy excludes that mailbox | Grant **Mail.Send** + admin consent; check `Test-ApplicationAccessPolicy` |
 | `451 4.3.0 … Graph API /sendMail returned 404 for <mailbox>` | `O365_USERNAME_<n>` is not a real mailbox in the tenant | Fix the address, or create the mailbox |
 | `550 5.7.1 Client not authorized` | Legacy server IP not in allow-list | Add the server IP to `ALLOWED_CLIENT_IPS` in `.env` |
+| `530 5.7.0 Authentication required` | `RELAY_AUTH_POLICY=required`, so every client must log in | Give the application the relay username/password, or set `RELAY_AUTH_POLICY=optional` so apps without a password keep working |
+| `535 5.7.8 Authentication credentials invalid` | Wrong relay username/password | Check `RELAY_AUTH_USERNAME` / `RELAY_AUTH_CREDENTIALS`; the username is matched case-insensitively |
+| `504 5.5.4 Unrecognized authentication type` | Client only offers a mechanism the relay does not implement (e.g. NTLM, CRAM-MD5) | Switch the client to PLAIN or LOGIN |
+| `502 5.5.1 STARTTLS required` | `RELAY_AUTH_REQUIRE_TLS=true` but the client did not issue STARTTLS | Enable STARTTLS/SSL in the client, or set `RELAY_AUTH_REQUIRE_TLS=false` |
 | `550 5.7.1 Sender not allowed` | Sender address/domain not in allow-list | Add it to `ALLOWED_SENDERS` / `ALLOWED_SENDER_DOMAINS` |
 | `550 5.7.1 Sender has no relay account` | `UNMATCHED_SENDER_POLICY=strict` and no account matched | Add the sender to `O365_SEND_AS_<n>` / `O365_SEND_AS_DOMAINS_<n>`, or switch to `fallback` |
 | Mail arrives from the **wrong** O365 account | A `O365_SEND_AS_DOMAINS_<n>` rule is broader than intended, or the sender matched the fallback | Tighten the alias/domain lists; set `UNMATCHED_SENDER_POLICY=strict` to surface mismatches instead of hiding them |
@@ -347,6 +514,9 @@ Enable `LOG_LEVEL=DEBUG` for detailed SMTP conversation logs when diagnosing iss
 ## Security considerations
 
 - The relay is **not an open relay**: it rejects connections from IPs not in `ALLOWED_CLIENT_IPS`, mail from senders not matching `ALLOWED_SENDERS` / `ALLOWED_SENDER_DOMAINS`, and (in `strict` mode) senders with no configured account.
+- If `RELAY_AUTH_*` is configured, clients that offer credentials have them validated and a failed login is refused — but with the default `RELAY_AUTH_POLICY=optional` a client that sends no password is still accepted, so **the IP + sender allow-lists remain the real access control**. Set `RELAY_AUTH_POLICY=required` if you want authentication to be the gate.
+- Relay AUTH passwords are **never logged**, are compared in constant time, and are separate from the O365 credentials — a leaked relay password does not expose the Azure client secret.
+- `RELAY_AUTH_PASSWORD=*` (accept any password) gives no authentication value; it only satisfies clients that require a password field. Prefer Option 1 or 2 in [When the application insists on a username and password](#when-the-application-insists-on-a-username-and-password) on any network you do not fully control.
 - O365 credentials are **never logged** regardless of log level.
 - All traffic to O365 is encrypted with **TLS via STARTTLS** (or HTTPS for Graph).
 - Graph `Mail.Send` is tenant-wide by default — pair it with an [application access policy](#locking-the-app-down-to-specific-mailboxes) so the relay can only send as the mailboxes it needs.

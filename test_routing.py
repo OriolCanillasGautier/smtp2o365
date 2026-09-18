@@ -10,48 +10,14 @@ import os
 import sys
 import types
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "smoke_test"))
+
 # ---------------------------------------------------------------------------
 # Stub the runtime-only dependencies so relay.py can be imported.
 # ---------------------------------------------------------------------------
+import _stubs  # noqa: E402,F401  (aiosmtplib / aiosmtpd / dotenv stand-ins)
 
-aiosmtplib = types.ModuleType("aiosmtplib")
-
-
-class _SMTPException(Exception):
-    pass
-
-
-class _SMTPAuthenticationError(_SMTPException):
-    pass
-
-
-aiosmtplib.SMTPException = _SMTPException
-aiosmtplib.SMTPAuthenticationError = _SMTPAuthenticationError
-aiosmtplib.send = lambda *a, **k: None
-sys.modules["aiosmtplib"] = aiosmtplib
-
-aiosmtpd = types.ModuleType("aiosmtpd")
-aiosmtpd_controller = types.ModuleType("aiosmtpd.controller")
-
-
-class _Controller:
-    def __init__(self, *a, **k):
-        pass
-
-    def start(self):
-        pass
-
-    def stop(self):
-        pass
-
-
-aiosmtpd_controller.Controller = _Controller
-sys.modules["aiosmtpd"] = aiosmtpd
-sys.modules["aiosmtpd.controller"] = aiosmtpd_controller
-
-dotenv_mod = types.ModuleType("dotenv")
-dotenv_mod.load_dotenv = lambda *a, **k: True
-sys.modules["dotenv"] = dotenv_mod
+from aiosmtpd.smtp import AuthResult, LoginPassword  # noqa: E402
 
 # Minimal MSAL stand-in that records the apps it is asked to build, so the test
 # can assert one app (and therefore one token cache) per app registration.
@@ -247,6 +213,86 @@ check(
     problems,
 )
 relay.ACCOUNTS.remove(dupe)
+
+# ---------------------------------------------------------------------------
+print("\n[9] relay-side SMTP AUTH")
+check("no AUTH configured by default", relay.RELAY_AUTH_ENABLED is False)
+check("unknown user rejected", relay._auth_ok("nobody", "whatever") is False)
+check("empty username rejected", relay._auth_ok("", "") is False)
+
+relay.RELAY_AUTH_CREDENTIALS = {"sap@some.local": "s3cret"}
+relay.RELAY_AUTH_ANY = set()
+relay.RELAY_AUTH_ENABLED = True
+
+check("correct credential accepted", relay._auth_ok("sap@some.local", "s3cret") is True)
+check("username is case-insensitive", relay._auth_ok("SAP@SOME.LOCAL", "s3cret") is True)
+check("wrong password rejected", relay._auth_ok("sap@some.local", "wrong") is False)
+check("other sender's password rejected", relay._auth_ok("1@some.local", "s3cret") is False)
+
+relay.RELAY_AUTH_ANY = {"legacy"}
+check("any-password user accepted", relay._auth_ok("legacy", "literally-anything") is True)
+check("any-password user still needs a username", relay._auth_ok("", "x") is False)
+
+# authenticator integration: wrong credentials must let aiosmtpd send the 535
+# itself (handled=False).  handled=True would mean "already replied" and the
+# client would hang waiting for a response.
+session = types.SimpleNamespace(auth_data=None)
+good = relay.smtp_authenticator(None, session, None, "LOGIN", LoginPassword(b"sap@some.local", b"s3cret"))
+bad = relay.smtp_authenticator(None, session, None, "LOGIN", LoginPassword(b"sap@some.local", b"nope"))
+check("authenticator succeeds on valid login", good.success is True)
+check("authenticator fails with handled=False on bad password", bad.success is False and bad.handled is False)
+
+# --- handle_MAIL AUTH gate, for both policies ---------------------------------
+# A valid sender AND an allowed peer IP are used, so any rejection can only come
+# from the AUTH gate.
+handler = relay.RelayHandler()
+import asyncio  # noqa: E402
+
+peer = next(iter(relay.ALLOWED_IPS))
+
+
+def mail_envelope():
+    return types.SimpleNamespace(mail_from="", mail_options=[], rcpt_tos=[])
+
+
+def session_with(authenticated=None, auth_data=None):
+    return types.SimpleNamespace(
+        peer=(peer, 1234), authenticated=authenticated, auth_data=auth_data
+    )
+
+
+def mail(sess, sender="sap@some.local"):
+    return asyncio.run(handler.handle_MAIL(None, sess, mail_envelope(), sender, []))
+
+
+no_attempt = session_with()                       # client never sent AUTH
+ok_plain = session_with(authenticated=True)       # built-in PLAIN/LOGIN success
+ok_custom = session_with(auth_data=("x",))        # authenticator-supplied payload
+failed = session_with(authenticated=False)        # AUTH attempted, rejected
+
+# default policy: optional -> apps without a password keep working
+relay.RELAY_AUTH_POLICY = "optional"
+check("optional: no AUTH attempted -> accepted", mail(no_attempt), "250 OK")
+check("optional: successful AUTH -> accepted", mail(ok_plain), "250 OK")
+check("optional: auth_data only -> accepted", mail(ok_custom), "250 OK")
+check("optional: failed AUTH -> refused", mail(failed), "535 5.7.8 Authentication credentials invalid")
+
+# strict policy: everyone must authenticate
+relay.RELAY_AUTH_POLICY = "required"
+check("required: no AUTH attempted -> 530", mail(no_attempt), "530 5.7.0 Authentication required")
+check("required: failed AUTH -> 530", mail(failed), "530 5.7.0 Authentication required")
+check("required: successful AUTH -> accepted", mail(ok_plain), "250 OK")
+relay.RELAY_AUTH_POLICY = "optional"
+
+# with no relay credentials at all, nothing is gated
+relay.RELAY_AUTH_ENABLED = False
+check("AUTH disabled: no AUTH attempted -> accepted", mail(no_attempt), "250 OK")
+relay.RELAY_AUTH_ENABLED = True
+
+relay.RELAY_AUTH_POLICY = "bogus"
+problems = relay._validate_configuration()
+check("invalid RELAY_AUTH_POLICY is reported", any("RELAY_AUTH_POLICY" in p for p in problems), True)
+relay.RELAY_AUTH_POLICY = "optional"
 
 # ---------------------------------------------------------------------------
 print()

@@ -25,9 +25,11 @@ same directory).  See .env.example for full documentation.
 """
 
 import base64
+import hmac
 import logging
 import os
 import re
+import ssl
 import time
 from dataclasses import dataclass, field
 from email import message_from_bytes
@@ -37,6 +39,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import aiosmtplib
 from aiosmtpd.controller import Controller
+from aiosmtpd.smtp import AuthResult, LoginPassword
 from dotenv import load_dotenv
 
 # ---------------------------------------------------------------------------
@@ -130,6 +133,90 @@ ALLOWED_DOMAINS: Set[str] = _csv_set("ALLOWED_SENDER_DOMAINS", "some.local")
 # Client IP addresses that may connect to this relay.
 # Setting this empty disables IP filtering (use only in isolated networks).
 ALLOWED_IPS: Set[str] = _csv_set("ALLOWED_CLIENT_IPS", "127.0.0.1,::1")
+
+# ---------------------------------------------------------------------------
+# SMTP AUTH on the relay itself (legacy clients that insist on a password)
+# ---------------------------------------------------------------------------
+#
+# Legacy services often refuse to submit mail unless they are given a username
+# and password.  The relay can therefore advertise and accept SMTP AUTH:
+#
+#   RELAY_AUTH_USERNAME / RELAY_AUTH_PASSWORD
+#        One shared credential used by every legacy service.
+#
+#   RELAY_AUTH_CREDENTIALS
+#        Per-sender credentials: "user:pass,user:pass".  The username may be the
+#        sender address, so each application logs in with its own identity.
+#
+# When neither is set, AUTH is not advertised at all and the relay behaves
+# exactly as before (IP + sender allow-lists only).
+#
+# These are credentials for *this relay*, not for Office 365 — the O365/Graph
+# authentication is unchanged and invisible to the legacy client.
+
+RELAY_AUTH_USERNAME: str = (
+    os.getenv("RELAY_AUTH_USERNAME", "").strip() or os.getenv("LISTEN_AUTH_USERNAME", "").strip()
+)
+RELAY_AUTH_PASSWORD: str = (
+    os.getenv("RELAY_AUTH_PASSWORD", "").strip() or os.getenv("LISTEN_AUTH_PASSWORD", "").strip()
+)
+
+# Usernames that are accepted with ANY password. Use "," or "*" (or leave
+# RELAY_AUTH_PASSWORD empty while setting a username) — the password is then
+# ignored and only the IP/sender allow-lists protect the relay.
+RELAY_AUTH_ANY: Set[str] = set()
+
+
+def _parse_credentials(raw: str) -> Dict[str, str]:
+    """Parse "user:pass,user:pass" into a username → password mapping."""
+    creds: Dict[str, str] = {}
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if not pair:
+            continue
+        if ":" not in pair:
+            log.warning("Ignoring malformed RELAY_AUTH_CREDENTIALS entry %r (expected user:pass)", pair)
+            continue
+        user, _, password = pair.partition(":")
+        user = user.strip().lower()
+        if user:
+            creds[user] = password
+    return creds
+
+
+RELAY_AUTH_CREDENTIALS: Dict[str, str] = _parse_credentials(
+    os.getenv("RELAY_AUTH_CREDENTIALS", "")
+)
+
+# A star password ("user:*") marks that username as "any password accepted".
+RELAY_AUTH_ANY = {u for u, p in RELAY_AUTH_CREDENTIALS.items() if p == "*"}
+for _u in list(RELAY_AUTH_ANY):
+    RELAY_AUTH_CREDENTIALS.pop(_u, None)
+
+if RELAY_AUTH_USERNAME:
+    if RELAY_AUTH_PASSWORD and RELAY_AUTH_PASSWORD != "*":
+        RELAY_AUTH_CREDENTIALS.setdefault(RELAY_AUTH_USERNAME.lower(), RELAY_AUTH_PASSWORD)
+    else:
+        RELAY_AUTH_ANY.add(RELAY_AUTH_USERNAME.lower())
+
+RELAY_AUTH_ENABLED: bool = bool(RELAY_AUTH_CREDENTIALS or RELAY_AUTH_ANY)
+
+# Whether a client MUST authenticate before it may send mail:
+#
+#   optional (default) — AUTH is offered and validated when a client uses it,
+#                        but applications that send no credentials are still
+#                        accepted (guarded by the IP + sender allow-lists).
+#   required           — mail is refused with "530 Authentication required"
+#                        unless the client authenticated successfully.
+RELAY_AUTH_POLICY: str = os.getenv("RELAY_AUTH_POLICY", "optional").strip().lower()
+
+# Require STARTTLS before accepting AUTH. Only enable this if you also give the
+# relay a TLS certificate (see LISTEN_TLS_CERT / LISTEN_TLS_KEY).
+RELAY_AUTH_REQUIRE_TLS: bool = os.getenv("RELAY_AUTH_REQUIRE_TLS", "false").lower() in ("1", "true", "yes")
+
+# Optional STARTTLS on the relay listener (PEM cert + key).
+LISTEN_TLS_CERT: str = os.getenv("LISTEN_TLS_CERT", "").strip()
+LISTEN_TLS_KEY: str = os.getenv("LISTEN_TLS_KEY", "").strip()
 
 # ---------------------------------------------------------------------------
 # Sender accounts
@@ -310,6 +397,88 @@ async def _get_access_token(account: Account) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _auth_ok(username: str, password: str) -> bool:
+    """Validate a legacy client's SMTP AUTH credentials."""
+    user = (username or "").strip().lower()
+    if not user:
+        return False
+    if user in RELAY_AUTH_ANY:
+        return True
+    expected = RELAY_AUTH_CREDENTIALS.get(user)
+    if expected is None:
+        return False
+    return hmac.compare_digest(expected, password or "")
+
+
+def smtp_authenticator(server, session, envelope, mechanism, auth_data):
+    """aiosmtpd SMTP AUTH callback.
+
+    Accepts any username/password the legacy client sends when the relay is
+    configured for that (a username listed in RELAY_AUTH_ANY), otherwise checks
+    the configured credentials.  Returning an AuthResult keeps aiosmtpd in
+    charge of the 334/235/535 protocol exchange.
+    """
+    if not RELAY_AUTH_ENABLED:
+        # AUTH is not configured; aiosmtpd only calls this for mechanisms the
+        # server advertises, so this is a belt-and-braces guard.
+        return AuthResult(success=False, handled=False)
+
+    if not isinstance(auth_data, LoginPassword):
+        # We do not implement GSSAPI/EXTERNAL.
+        return AuthResult(success=False, handled=False)
+
+    # Record that this client actually attempted AUTH.  aiosmtpd reports a
+    # rejected login as session.authenticated=None (indistinguishable from "never
+    # tried"), so without this flag a bad password would silently fall back to
+    # the no-AUTH path in optional mode.
+    session.auth_attempted = True
+
+    username = auth_data.login.decode("utf-8", "replace") if auth_data.login else ""
+    password = auth_data.password.decode("utf-8", "replace") if auth_data.password else ""
+
+    if _auth_ok(username, password):
+        session.auth_user = username
+        return AuthResult(success=True)
+    # handled=False tells aiosmtpd to send "535 5.7.8 Authentication credentials
+    # invalid" itself.  (handled=True means "I already replied", and would leave
+    # the client waiting forever.)
+    return AuthResult(success=False, handled=False)
+
+
+def auth_is_configured() -> bool:
+    return RELAY_AUTH_ENABLED
+
+
+def auth_is_required() -> bool:
+    return RELAY_AUTH_ENABLED and RELAY_AUTH_POLICY == "required"
+
+
+def auth_outcome(session) -> str:
+    """Classify the session's SMTP AUTH state.
+
+    ``ok``     — authenticated (aiosmtpd sets ``authenticated``, or the
+                 authenticator supplied ``auth_data``).
+    ``failed`` — credentials were offered and rejected.  aiosmtpd reports this
+                 as ``authenticated=None``, so the authenticator also flags the
+                 attempt on the session.
+    ``none``   — the client never offered credentials.
+    """
+    if getattr(session, "authenticated", None) is True:
+        return "ok"
+    if getattr(session, "auth_data", None) is not None:
+        return "ok"
+    if getattr(session, "authenticated", None) is False:
+        return "failed"
+    if getattr(session, "auth_attempted", False):
+        return "failed"
+    return "none"
+
+
+def client_is_authenticated(session) -> bool:
+    """True if the client passed SMTP AUTH in this session."""
+    return auth_outcome(session) == "ok"
+
+
 def sender_allowed(address: str) -> bool:
     """Return True if the envelope sender is in the allow-list."""
     addr = address.lower().strip()
@@ -476,6 +645,29 @@ class RelayHandler:
             log.warning("Rejected connection from %s — not in ALLOWED_CLIENT_IPS", peer)
             return "550 5.7.1 Client not authorized"
 
+        # SMTP AUTH gate.  With RELAY_AUTH_POLICY=optional (the default) a client
+        # that sends no credentials is still accepted, so applications that do
+        # not support AUTH keep working; a client that DID try and failed is
+        # rejected.  With policy=required every client must authenticate.
+        if auth_is_required():
+            outcome = auth_outcome(session)
+            if outcome != "ok":
+                log.warning(
+                    "Rejected MAIL FROM <%s> from %s — authentication %s "
+                    "(RELAY_AUTH_POLICY=required)",
+                    address,
+                    peer,
+                    "failed" if outcome == "failed" else "missing",
+                )
+                return "530 5.7.0 Authentication required"
+        elif auth_outcome(session) == "failed":
+            log.warning(
+                "Rejected MAIL FROM <%s> from %s — SMTP AUTH credentials were rejected",
+                address,
+                peer,
+            )
+            return "535 5.7.8 Authentication credentials invalid"
+
         # Reject mail from addresses / domains not in the allow-list.
         if not sender_allowed(address):
             log.warning("Rejected MAIL FROM <%s> — sender not allowed", address)
@@ -607,6 +799,17 @@ def _validate_configuration() -> List[str]:
             f"(got {UNMATCHED_SENDER_POLICY!r})"
         )
 
+    if RELAY_AUTH_POLICY not in ("optional", "required"):
+        problems.append(
+            f"RELAY_AUTH_POLICY must be 'optional' or 'required' (got {RELAY_AUTH_POLICY!r})"
+        )
+
+    if RELAY_AUTH_REQUIRE_TLS and not (LISTEN_TLS_CERT and LISTEN_TLS_KEY):
+        problems.append(
+            "RELAY_AUTH_REQUIRE_TLS=true needs LISTEN_TLS_CERT and LISTEN_TLS_KEY "
+            "(otherwise no client can ever authenticate)"
+        )
+
     return problems
 
 
@@ -620,6 +823,19 @@ def main() -> None:
 
     log.info("SMTP-Relay starting  (auth mode: %s)", AUTH_MODE)
     log.info("  Listening on     : %s:%d", LISTEN_HOST, LISTEN_PORT)
+    # Timestamps in the log are the container's naive local time; state the offset
+    # so they can be compared with the times other systems report.  (The offset
+    # must come from time.altzone/time.timezone, not from mktime() of localtime()
+    # vs gmtime(), which double-counts DST.)
+    local_now = time.localtime()
+    offset_seconds = -(time.altzone if local_now.tm_isdst else time.timezone)
+    offset_hours = offset_seconds / 3600
+    log.info(
+        "  Clock            : %s (%s, UTC%+g) — log timestamps use this timezone",
+        time.strftime("%Y-%m-%d %H:%M:%S", local_now),
+        time.strftime("%Z", local_now) or "local",
+        offset_hours,
+    )
     log.info("  Accounts         : %d", len(ACCOUNTS))
     for account in ACCOUNTS:
         extra: List[str] = []
@@ -651,7 +867,45 @@ def main() -> None:
     log.info("  Allowed IPs      : %s", ALLOWED_IPS or "(ALL — consider restricting)")
     log.info("  Rewrite From     : %s", REWRITE_FROM)
 
-    controller = Controller(RelayHandler(), hostname=LISTEN_HOST, port=LISTEN_PORT)
+    if RELAY_AUTH_ENABLED:
+        users = sorted(RELAY_AUTH_CREDENTIALS) + [f"{u} (any password)" for u in sorted(RELAY_AUTH_ANY)]
+        log.info("  SMTP AUTH        : offered — accepted user(s): %s", ", ".join(users))
+        if auth_is_required():
+            log.info("  AUTH policy      : required (clients without AUTH are rejected)")
+        else:
+            log.info("  AUTH policy      : optional (clients without AUTH are still accepted)")
+        if RELAY_AUTH_REQUIRE_TLS:
+            log.info("  AUTH over TLS    : required")
+    else:
+        log.info("  SMTP AUTH        : no relay credentials configured (IP + sender allow-lists only)")
+
+    tls_context = None
+    if LISTEN_TLS_CERT and LISTEN_TLS_KEY:
+        tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        tls_context.load_cert_chain(LISTEN_TLS_CERT, LISTEN_TLS_KEY)
+        log.info("  STARTTLS         : enabled (%s)", LISTEN_TLS_CERT)
+    elif LISTEN_TLS_CERT or LISTEN_TLS_KEY:
+        log.warning("LISTEN_TLS_CERT and LISTEN_TLS_KEY must both be set — STARTTLS disabled")
+
+    # aiosmtpd's SMTP class defaults auth_require_tls to True, which would hide
+    # the AUTH advertisement and answer "538 Encryption required" on a plaintext
+    # connection.  Pass our own setting through explicitly.
+    #
+    # auth_required is True only for RELAY_AUTH_POLICY=required: aiosmtpd then
+    # refuses MAIL/RCPT/DATA until the client logs in.  In optional mode the
+    # authenticator is still active, so clients that DO offer credentials are
+    # validated, while clients that offer none are let through to the handler.
+    controller = Controller(
+        RelayHandler(),
+        hostname=LISTEN_HOST,
+        port=LISTEN_PORT,
+        authenticator=smtp_authenticator if RELAY_AUTH_ENABLED else None,
+        auth_required=auth_is_required(),
+        auth_require_tls=RELAY_AUTH_REQUIRE_TLS,
+        tls_context=tls_context,
+        require_starttls=bool(tls_context),
+    )
+
     controller.start()
     log.info("Ready. Waiting for connections…")
 

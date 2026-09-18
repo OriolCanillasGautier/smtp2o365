@@ -1,5 +1,44 @@
+# --- Secrets ---------------------------------------------------------------
+# .env holds the Azure client secret and the relay passwords, so neither it nor
+# any backup/derivative of it may ever be committed. The public template
+# (.env.example) is re-included at the end.
+#
+# Covers: .env, .env_backup, env_backup, .env.backup, .env.local, .env.old,
+#         .env.save, .env.bak, .env2, env_backup2, ...
 .env
+.env.*
+env_backup
+env_backup*
+*_env_*
+*-env-*
+*.env_backup
+*.env.backup
+*.env.bak
+*.env.old
+*.env.save
+*.env.local
+!.env.example
+
+# --- Common backup extensions ----------------------------------------------
+# A "cp .env .env.bak" style copy is the usual way a secret escapes.
+*.bak
+*.orig
+*.save
+*.copy
+*.backup
+*~
+
+# --- Python ----------------------------------------------------------------
 *.pyc
 __pycache__/
+
+# --- Private, environment-specific tooling ---------------------------------
+# smoke_test/ hardcodes this deployment's internal addresses, mailbox names and
+# test passwords, so it stays local to each installation and is never published.
+smoke_test/
+
+# --- Virtualenvs -----------------------------------------------------------
 .venv/
 venv/
+# Local-only dependencies installed for the integration test
+.venv-test/
